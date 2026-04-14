@@ -11,6 +11,16 @@ FROM vllm/vllm-openai:v0.19.0
 # so a partial pass (e.g. index without version) does not silently fall back
 # to latest-on-index. TORCHAUDIO_VERSION and TORCHVISION_VERSION are optional —
 # they are appended only if provided, using ${VAR:+value} bash expansion.
+#
+# Transitive-dep floor alignment: numpy==2.2.6 and setuptools==80.10.2 are
+# hard-pinned inside the same overlay step. Without these, `pip install
+# --force-reinstall torch==...` pulls latest numpy (2.4.4) and setuptools
+# (82.0.1) as transitive deps of torch, which then violate lmcache (numpy
+# <=2.2.6, setuptools <81.0.0), mistral-common (numpy <2.4), numba
+# (numpy <2.3), and vLLM 0.19.0's own setuptools <81.0.0 pin. The 2.2.6 /
+# 80.10.2 values are what vLLM 0.19.0's resolver selects on a clean LAN
+# build_runner.py build (captured from the running 122b production replica
+# aff65fe3 on 2026-04-14) — a production-proven coordinated stack.
 ARG TORCH_INDEX_URL=""
 ARG TORCH_VERSION=""
 ARG TORCHAUDIO_VERSION=""
@@ -22,7 +32,9 @@ RUN if [ -n "$TORCH_INDEX_URL" ] && [ -n "$TORCH_VERSION" ]; then \
         --extra-index-url https://pypi.org/simple \
         "torch==${TORCH_VERSION}" \
         ${TORCHAUDIO_VERSION:+"torchaudio==${TORCHAUDIO_VERSION}"} \
-        ${TORCHVISION_VERSION:+"torchvision==${TORCHVISION_VERSION}"}; \
+        ${TORCHVISION_VERSION:+"torchvision==${TORCHVISION_VERSION}"} \
+        "numpy==2.2.6" \
+        "setuptools==80.10.2"; \
     fi
 
 RUN LIBRARY_PATH=/usr/local/cuda/lib64/stubs:${LIBRARY_PATH} pip install kvcached --no-build-isolation
