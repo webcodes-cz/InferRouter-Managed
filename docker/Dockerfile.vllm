@@ -1,4 +1,30 @@
 FROM vllm/vllm-openai:v0.19.0
+
+# AS-006a: optional coordinated torch-stack overlay.
+#
+# When build_managed.py threads --build-arg for these keys, the overlay
+# replaces whatever torch/torchaudio/torchvision the upstream vllm-openai
+# base image baked in. When the ARGs are unset (backward-compatible default),
+# this layer is a no-op and the base image's torch stack is kept as-is.
+#
+# The overlay is gated on BOTH TORCH_INDEX_URL and TORCH_VERSION being set,
+# so a partial pass (e.g. index without version) does not silently fall back
+# to latest-on-index. TORCHAUDIO_VERSION and TORCHVISION_VERSION are optional —
+# they are appended only if provided, using ${VAR:+value} bash expansion.
+ARG TORCH_INDEX_URL=""
+ARG TORCH_VERSION=""
+ARG TORCHAUDIO_VERSION=""
+ARG TORCHVISION_VERSION=""
+
+RUN if [ -n "$TORCH_INDEX_URL" ] && [ -n "$TORCH_VERSION" ]; then \
+      pip install --force-reinstall --no-cache-dir \
+        --index-url "$TORCH_INDEX_URL" \
+        --extra-index-url https://pypi.org/simple \
+        "torch==${TORCH_VERSION}" \
+        ${TORCHAUDIO_VERSION:+"torchaudio==${TORCHAUDIO_VERSION}"} \
+        ${TORCHVISION_VERSION:+"torchvision==${TORCHVISION_VERSION}"}; \
+    fi
+
 RUN LIBRARY_PATH=/usr/local/cuda/lib64/stubs:${LIBRARY_PATH} pip install kvcached --no-build-isolation
 
 ENV ENABLE_KVCACHED=true
