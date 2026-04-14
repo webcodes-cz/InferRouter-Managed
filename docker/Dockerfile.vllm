@@ -37,7 +37,22 @@ RUN if [ -n "$TORCH_INDEX_URL" ] && [ -n "$TORCH_VERSION" ]; then \
         "setuptools==80.10.2"; \
     fi
 
-RUN LIBRARY_PATH=/usr/local/cuda/lib64/stubs:${LIBRARY_PATH} pip install kvcached --no-build-isolation
+# AS-006d: install kvcached from the fork's own source (this build context)
+# instead of the PyPI release. Required so fork patches (e.g. the per-engine
+# fallback to stock vLLM when kv_cache_config uses unsupported specs such as
+# MambaSpec in Qwen3.5-122B-A10B) actually ship into the runtime image.
+#
+# --no-deps is critical: pip install without it re-resolves kvcached's
+# transitive deps (torch, vllm) and can silently upgrade the stack out from
+# under the AS-006a overlay pins (torch 2.10.0+cu130 / numpy 2.2.6 /
+# setuptools 80.10.2, captured from the running LAN 122b production replica
+# aff65fe3). With --no-deps, only the kvcached package contents are replaced;
+# the upstream vllm-openai base image + AS-006a overlay torch stack is
+# preserved verbatim. kvcached's runtime deps (vllm, torch) are already
+# satisfied by the base + overlay so skipping re-resolution costs nothing.
+COPY . /tmp/kvcached-src
+RUN LIBRARY_PATH=/usr/local/cuda/lib64/stubs:${LIBRARY_PATH} \
+    pip install --no-deps /tmp/kvcached-src --no-build-isolation
 
 ENV ENABLE_KVCACHED=true
 ENV KVCACHED_AUTOPATCH=1

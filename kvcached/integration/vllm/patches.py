@@ -13,6 +13,15 @@ from typing import TYPE_CHECKING, Any, Iterable, Optional
 
 from kvcached.integration.patch_base import BasePatch, enable_kvcached
 from kvcached.integration.version_utils import VersionAwarePatch, VersionRange, version_range
+from kvcached.utils import get_kvcached_logger
+
+_module_logger = get_kvcached_logger()
+
+# Per-process memo of fallback reasons we have already logged once, so a
+# supported-spec engine does not spam the fallback warning every time we
+# re-enter the gate. Keyed by the reason string produced by
+# _is_kvcached_supported_kv_cache_config.
+_KVCACHED_FALLBACK_LOGGED: set[str] = set()
 
 if TYPE_CHECKING:
     # These types are imported from vLLM at runtime via getattr()
@@ -28,39 +37,83 @@ if TYPE_CHECKING:
         Request = Any  # type: ignore[misc,assignment]
 
 
-def _validate_kv_cache_groups(kv_cache_config: Any) -> None:
-    """Validate KV cache groups for kvcached compatibility.
+def _is_kvcached_supported_kv_cache_config(
+    kv_cache_config: Any,
+) -> tuple[bool, Optional[str]]:
+    """Return ``(supported, reason)`` for the given KV cache config.
 
-    Checks that all groups use supported spec types (FullAttentionSpec,
-    SlidingWindowSpec, or MLAAttentionSpec) and that all groups share the
-    same block geometry (block_size and cell_size).  Raises ValueError on
-    mismatch.
+    ``reason`` is ``None`` iff ``supported`` is ``True``. A config is
+    unsupported if any of:
+    - a group uses a spec outside ``FullAttentionSpec``, ``SlidingWindowSpec``,
+      ``MLAAttentionSpec`` (e.g. ``MambaSpec`` in hybrid-attention models such
+      as Qwen3.5-122B-A10B);
+    - groups have mismatched block or cell geometry.
+
+    The function is pure and idempotent; callers may invoke it repeatedly on
+    the same config without side effects (logging is handled by
+    ``_should_use_kvcached_for_config``).
     """
-    from vllm.v1.kv_cache_interface import FullAttentionSpec, MLAAttentionSpec, SlidingWindowSpec
+    from vllm.v1.kv_cache_interface import (
+        FullAttentionSpec,
+        MLAAttentionSpec,
+        SlidingWindowSpec,
+    )
 
     supported = (FullAttentionSpec, SlidingWindowSpec, MLAAttentionSpec)
     kv_groups = kv_cache_config.kv_cache_groups
+    if not kv_groups:
+        return True, None
 
     first_spec = kv_groups[0].kv_cache_spec
+    if not isinstance(first_spec, supported):
+        return False, f"group 0: {type(first_spec).__name__}"
+
     block_size = first_spec.block_size
     cell_size, _ = _get_kv_cache_params(first_spec, block_size)
 
     for idx, grp in enumerate(kv_groups):
-        grp_spec = grp.kv_cache_spec
-        if not isinstance(grp_spec, supported):
-            raise ValueError(
-                f"kvcached only supports FullAttentionSpec, SlidingWindowSpec, "
-                f"and MLAAttentionSpec, got {type(grp_spec).__name__} in group {idx}"
-            )
-        grp_block_size = grp_spec.block_size
-        grp_cell_size, _ = _get_kv_cache_params(grp_spec, grp_block_size)
+        spec = grp.kv_cache_spec
+        if not isinstance(spec, supported):
+            return False, f"group {idx}: {type(spec).__name__}"
+        grp_block_size = spec.block_size
+        grp_cell_size, _ = _get_kv_cache_params(spec, grp_block_size)
         if grp_block_size != block_size or grp_cell_size != cell_size:
-            raise ValueError(
-                "kvcached requires all KV cache groups to have the "
-                f"same block geometry. Group 0: block_size={block_size},"
-                f" cell_size={cell_size}; group {idx}: "
-                f"block_size={grp_block_size}, cell_size={grp_cell_size}"
+            return False, (
+                f"mixed block geometry between groups 0 and {idx} "
+                f"(block {block_size}->{grp_block_size}, "
+                f"cell {cell_size}->{grp_cell_size})"
             )
+
+    return True, None
+
+
+def _should_use_kvcached_for_config(kv_cache_config: Any) -> bool:
+    """Single decision point for every kvcached lifecycle patch.
+
+    Returns ``True`` iff ``enable_kvcached()`` is on AND the config is
+    structurally compatible with kvcached's KV-cache assumptions. On the
+    first call per unique fallback reason in a given process, emits one
+    warning so engine logs show why kvcached stepped aside.
+
+    Callers that branch on this (allocator, reshape, coordinator setup,
+    v0.8 initializer) MUST all consult this helper. Mixing a config-aware
+    gate here with ``enable_kvcached()``-only gates elsewhere produces
+    split state (e.g. alloc falls back but reshape still assumes
+    kvcached-owned tensors), which crashes at reshape time.
+    """
+    if not enable_kvcached():
+        return False
+    supported, reason = _is_kvcached_supported_kv_cache_config(kv_cache_config)
+    if not supported:
+        assert reason is not None
+        if reason not in _KVCACHED_FALLBACK_LOGGED:
+            _KVCACHED_FALLBACK_LOGGED.add(reason)
+            _module_logger.warning(
+                "kvcached: unsupported KV cache config (%s); "
+                "falling back to stock vLLM for this engine",
+                reason,
+            )
+    return supported
 
 
 def _count_kv_cache_layers(kv_cache_config: Any) -> int:
@@ -495,13 +548,16 @@ class KVCacheCoordinatorPatch(VersionAwarePatch, BasePatch):
                 return
 
         def _setup_kvcached_coordinator(self) -> None:
+            kv_cache_config = getattr(self, "kv_cache_config")
+            if not _should_use_kvcached_for_config(kv_cache_config):
+                # Unsupported config (e.g. MambaSpec hybrid-attention): leave
+                # the stock vLLM coordinator + block_pool in place. The
+                # warning was already emitted by _should_use_kvcached_for_config.
+                return
+
             enable_caching = getattr(self, "enable_caching", False)
             if enable_caching:
                 logger.info("Prefix caching enabled for kvcached")
-
-            kv_cache_config = getattr(self, "kv_cache_config")
-
-            _validate_kv_cache_groups(kv_cache_config)
 
             # All groups validated to share the same block geometry,
             # so group 0's spec is representative.
@@ -794,10 +850,11 @@ class GPUModelRunnerPatch(VersionAwarePatch, BasePatch):
 
             from kvcached.integration.vllm import interfaces as kvi
 
-            if not enable_kvcached():
+            if not _should_use_kvcached_for_config(kv_cache_config):
+                # Env gate off OR config unsupported (e.g. MambaSpec): delegate
+                # to stock vLLM initializer. Warning (if any) was emitted by
+                # _should_use_kvcached_for_config.
                 return original_initialize_kv_cache(self, kv_cache_config)
-
-            _validate_kv_cache_groups(kv_cache_config)
 
             kv_caches: dict[str, torch.Tensor] = {}
             for kv_cache_group in kv_cache_config.kv_cache_groups:
@@ -811,7 +868,7 @@ class GPUModelRunnerPatch(VersionAwarePatch, BasePatch):
             num_layers = _count_kv_cache_layers(kv_cache_config)
             layer_name = list(kv_cache_config.tensors.keys())[0]
             # All groups validated to share the same block geometry by
-            # _validate_kv_cache_groups, so group 0's spec is representative.
+            # _should_use_kvcached_for_config, so group 0's spec is representative.
             kv_cache_spec = kv_cache_config.kv_cache_groups[0].kv_cache_spec
             tensor_config = kv_cache_config.tensors[layer_name]
 
@@ -866,10 +923,13 @@ class GPUModelRunnerPatch(VersionAwarePatch, BasePatch):
 
             from kvcached.integration.vllm import interfaces as kvi
 
-            _validate_kv_cache_groups(kv_cache_config)
+            # No validation call here: callers (patched _allocate_kv_cache_tensors
+            # below) gate on _should_use_kvcached_for_config before reaching this
+            # function, so the config is already known to be kvcached-compatible.
 
-            # All groups validated to share the same block geometry by
-            # _validate_kv_cache_groups, so group 0's spec is representative.
+            # All groups share the same block geometry (precondition ensured by
+            # _should_use_kvcached_for_config at the caller), so group 0's spec
+            # is representative.
             first_kv_cache_group = kv_cache_config.kv_cache_groups[0]
             kv_cache_spec = first_kv_cache_group.kv_cache_spec
 
@@ -939,7 +999,13 @@ class GPUModelRunnerPatch(VersionAwarePatch, BasePatch):
             return True
 
         def _patched_alloc_kv(self, kv_cache_config, *args: Any, **kwargs: Any):
-            if enable_kvcached():
+            # _should_use_kvcached_for_config combines env gate + config
+            # compatibility. Unsupported configs (e.g. MambaSpec) cleanly
+            # fall back to vLLM's stock _allocate_kv_cache_tensors. This
+            # MUST use the same gate as _patched_reshape_kv below or the
+            # engine ends up in a half-kvcached, half-stock state that
+            # crashes at reshape time.
+            if _should_use_kvcached_for_config(kv_cache_config):
                 return self._allocate_kv_cache_from_kvcached(kv_cache_config)
             return original_method(self, kv_cache_config, *args, **kwargs)
 
@@ -984,7 +1050,11 @@ class GPUModelRunnerPatch(VersionAwarePatch, BasePatch):
             return True
 
         def _patched_reshape_kv(self, kv_cache_config, kv_cache_raw_tensors, *args: Any, **kwargs: Any):
-            if enable_kvcached():
+            # Use the same gate as _patched_alloc_kv above. If alloc fell
+            # back to stock vLLM (unsupported spec), reshape MUST also
+            # stay on the stock path, or it will try to reshape into
+            # kvcached-owned tensors that were never produced.
+            if _should_use_kvcached_for_config(kv_cache_config):
                 return self._reshape_kv_cache_tensors_from_kvcached(
                     kv_cache_config, kv_cache_raw_tensors, *args, **kwargs
                 )
