@@ -44,7 +44,7 @@ def get_extensions():
     cxx_abi = torch._C._GLIBCXX_USE_CXX11_ABI
 
     extra_compile_args = [
-        "-std=c++17", f"-D_GLIBCXX_USE_CXX11_ABI={int(cxx_abi)}"
+        "-std=c++20", f"-D_GLIBCXX_USE_CXX11_ABI={int(cxx_abi)}"
     ]
 
     vmm_ops_module = CUDAExtension(
