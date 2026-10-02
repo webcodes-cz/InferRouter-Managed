@@ -43,9 +43,8 @@ def get_extensions():
     # Get the C++ ABI flag from PyTorch
     cxx_abi = torch._C._GLIBCXX_USE_CXX11_ABI
 
-    extra_compile_args = [
-        "-std=c++17", f"-D_GLIBCXX_USE_CXX11_ABI={int(cxx_abi)}"
-    ]
+    # BuildExtension selects the standard required by the installed PyTorch.
+    extra_compile_args = [f"-D_GLIBCXX_USE_CXX11_ABI={int(cxx_abi)}"]
 
     vmm_ops_module = CUDAExtension(
         "kvcached.vmm_ops",
